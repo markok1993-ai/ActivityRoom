@@ -16,6 +16,7 @@ const MIN_PLAYERS = 4;
 const BOARD_SPOTS = 48;
 const BOARD_END = BOARD_SPOTS + 1;
 const TURN_SECONDS = 60;
+const EMPTY_ROOM_TTL_MS = 10 * 60 * 1000;
 const DIFFICULTIES = [3, 4, 5];
 const ACTIVITIES = ["describe", "draw", "mime"];
 
@@ -170,6 +171,7 @@ function makeRoom(hostId, language) {
     currentActivity: null,
     currentCard: null,
     timer: null,
+    cleanupTimer: null,
     endsAt: null,
     log: []
   };
@@ -203,8 +205,13 @@ function sanitizeName(name) {
   return String(name || "").trim().slice(0, 24) || "Player";
 }
 
-function getPlayer(room, socketId) {
-  return room.players.find((player) => player.id === socketId);
+function sanitizeClientId(clientId) {
+  const value = String(clientId || "").trim();
+  return /^[a-zA-Z0-9_-]{12,64}$/.test(value) ? value : null;
+}
+
+function getPlayer(room, clientId) {
+  return room.players.find((player) => player.id === clientId);
 }
 
 function activePlayers(room) {
@@ -328,7 +335,7 @@ function stateFor(room, viewerId) {
 
 function emitRoom(room) {
   room.players.forEach((player) => {
-    io.to(player.id).emit("state", stateFor(room, player.id));
+    if (player.socketId) io.to(player.socketId).emit("state", stateFor(room, player.id));
   });
 }
 
@@ -473,39 +480,51 @@ function leaveRoom(socket) {
   if (!code || !rooms.has(code)) return;
 
   const room = rooms.get(code);
-  const wasActor = currentActor(room)?.id === socket.id;
-  const player = getPlayer(room, socket.id);
-  if (player) player.connected = false;
+  const clientId = socket.data.clientId;
+  const player = getPlayer(room, clientId);
+  if (player && player.socketId === socket.id) {
+    player.connected = false;
+    player.socketId = null;
+  }
 
-  if (room.hostId === socket.id) {
+  if (room.hostId === clientId) {
     const nextHost = room.players.find((candidate) => candidate.connected);
     room.hostId = nextHost ? nextHost.id : room.hostId;
   }
 
   if (!activePlayers(room).length) {
-    clearTurnTimer(room);
-    rooms.delete(code);
+    clearTimeout(room.cleanupTimer);
+    room.cleanupTimer = setTimeout(() => {
+      if (!activePlayers(room).length) {
+        clearTurnTimer(room);
+        rooms.delete(code);
+      }
+    }, EMPTY_ROOM_TTL_MS);
     return;
   }
 
-  if (room.status === "playing" && wasActor) {
-    finishTurn(room, false);
-  } else {
-    emitRoom(room);
-  }
+  emitRoom(room);
 }
 
 io.on("connection", (socket) => {
-  socket.on("createRoom", ({ name, language }, reply) => {
-    const room = makeRoom(socket.id, language);
+  socket.on("createRoom", ({ name, language, clientId }, reply) => {
+    const stableId = sanitizeClientId(clientId);
+    if (!stableId) {
+      reply?.({ ok: false, error: "badClient" });
+      return;
+    }
+
+    const room = makeRoom(stableId, language);
     const player = {
-      id: socket.id,
+      id: stableId,
+      socketId: socket.id,
       name: sanitizeName(name),
       teamId: null,
       color: room.players.length,
       connected: true
     };
     room.players.push(player);
+    socket.data.clientId = stableId;
     socket.data.roomCode = room.code;
     socket.join(room.code);
     pushLog(room, `${player.name} created room ${room.code}`);
@@ -513,12 +532,35 @@ io.on("connection", (socket) => {
     emitRoom(room);
   });
 
-  socket.on("joinRoom", ({ name, code }, reply) => {
+  socket.on("joinRoom", ({ name, code, clientId }, reply) => {
+    const stableId = sanitizeClientId(clientId);
+    if (!stableId) {
+      reply?.({ ok: false, error: "badClient" });
+      return;
+    }
+
     const room = rooms.get(String(code || "").trim().toUpperCase());
     if (!room) {
       reply?.({ ok: false, error: "roomNotFound" });
       return;
     }
+
+    clearTimeout(room.cleanupTimer);
+    room.cleanupTimer = null;
+
+    const existingPlayer = getPlayer(room, stableId);
+    if (existingPlayer) {
+      existingPlayer.name = sanitizeName(name) || existingPlayer.name;
+      existingPlayer.socketId = socket.id;
+      existingPlayer.connected = true;
+      socket.data.clientId = stableId;
+      socket.data.roomCode = room.code;
+      socket.join(room.code);
+      reply?.({ ok: true, code: room.code, reconnected: true });
+      emitRoom(room);
+      return;
+    }
+
     if (room.players.length >= MAX_PLAYERS) {
       reply?.({ ok: false, error: "roomFull" });
       return;
@@ -529,13 +571,15 @@ io.on("connection", (socket) => {
     }
 
     const player = {
-      id: socket.id,
+      id: stableId,
+      socketId: socket.id,
       name: sanitizeName(name),
       teamId: null,
       color: room.players.length,
       connected: true
     };
     room.players.push(player);
+    socket.data.clientId = stableId;
     socket.data.roomCode = room.code;
     socket.join(room.code);
     pushLog(room, `${player.name} joined`);
@@ -545,14 +589,14 @@ io.on("connection", (socket) => {
 
   socket.on("setLanguage", (language) => {
     const room = rooms.get(socket.data.roomCode);
-    if (!room || room.hostId !== socket.id || room.status !== "lobby") return;
+    if (!room || room.hostId !== socket.data.clientId || room.status !== "lobby") return;
     room.language = language === "sr" ? "sr" : "en";
     emitRoom(room);
   });
 
   socket.on("startGame", () => {
     const room = rooms.get(socket.data.roomCode);
-    if (!room || room.hostId !== socket.id || !canStart(room)) return;
+    if (!room || room.hostId !== socket.data.clientId || !canStart(room)) return;
     room.players.forEach((player) => {
       player.teamId = null;
     });
@@ -567,7 +611,7 @@ io.on("connection", (socket) => {
     if (!room || room.status !== "playing" || !room.currentCard) return;
     if (room.currentCard.special) return;
     const currentPlayer = currentActor(room);
-    if (room.hostId !== socket.id && currentPlayer?.id !== socket.id) return;
+    if (room.hostId !== socket.data.clientId && currentPlayer?.id !== socket.data.clientId) return;
     finishTurn(room, true);
   });
 
@@ -576,7 +620,7 @@ io.on("connection", (socket) => {
     if (!room || room.status !== "playing" || !room.currentCard?.special) return;
 
     const currentPlayer = currentActor(room);
-    if (room.hostId !== socket.id && currentPlayer?.id !== socket.id) return;
+    if (room.hostId !== socket.data.clientId && currentPlayer?.id !== socket.data.clientId) return;
 
     finishSpecialTurn(room, winnerTeamId);
   });
@@ -586,7 +630,7 @@ io.on("connection", (socket) => {
     if (!room || room.status !== "playing" || room.currentCard) return;
 
     const currentPlayer = currentActor(room);
-    if (room.hostId !== socket.id && currentPlayer?.id !== socket.id) return;
+    if (room.hostId !== socket.data.clientId && currentPlayer?.id !== socket.data.clientId) return;
 
     const value = Number(difficulty);
     if (!DIFFICULTIES.includes(value)) return;
@@ -602,13 +646,13 @@ io.on("connection", (socket) => {
     const room = rooms.get(socket.data.roomCode);
     if (!room || room.status !== "playing") return;
     const currentPlayer = currentActor(room);
-    if (room.hostId !== socket.id && currentPlayer?.id !== socket.id) return;
+    if (room.hostId !== socket.data.clientId && currentPlayer?.id !== socket.data.clientId) return;
     finishTurn(room, false);
   });
 
   socket.on("restart", () => {
     const room = rooms.get(socket.data.roomCode);
-    if (!room || room.hostId !== socket.id) return;
+    if (!room || room.hostId !== socket.data.clientId) return;
     room.status = "lobby";
     room.currentCard = null;
     room.currentActivity = null;

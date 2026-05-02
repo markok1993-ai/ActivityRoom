@@ -29,6 +29,7 @@ const text = {
     roomNotFound: "Room not found.",
     roomFull: "Room is full.",
     gameStarted: "This game already started.",
+    badClient: "Could not identify this device. Refresh and try again.",
     describe: "Describe",
     draw: "Draw",
     mime: "Mime",
@@ -65,6 +66,7 @@ const text = {
     roomNotFound: "Soba nije pronađena.",
     roomFull: "Soba je puna.",
     gameStarted: "Ova igra je već počela.",
+    badClient: "Uređaj nije prepoznat. Osveži stranicu i pokušaj opet.",
     describe: "Objasni",
     draw: "Crtaj",
     mime: "Pokazuj",
@@ -76,7 +78,10 @@ const text = {
 };
 
 const colors = ["#e44f4f", "#2f80ed", "#16a085", "#f2a900", "#8e44ad", "#f26b38", "#0097a7", "#6a8f2a"];
+const CLIENT_ID_KEY = "activity-client-id";
+const SESSION_KEY = "activity-session";
 let language = localStorage.getItem("activity-language") || "en";
+let clientId = getClientId();
 let state = null;
 let tick = null;
 let pendingCardFlip = false;
@@ -122,6 +127,35 @@ function t(key) {
   return text[language][key] || key;
 }
 
+function getClientId() {
+  let id = localStorage.getItem(CLIENT_ID_KEY);
+  if (!id) {
+    id = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    localStorage.setItem(CLIENT_ID_KEY, id);
+  }
+  return id;
+}
+
+function saveSession(code) {
+  localStorage.setItem(SESSION_KEY, JSON.stringify({
+    code,
+    name: els.name.value.trim(),
+    language
+  }));
+}
+
+function getSavedSession() {
+  try {
+    return JSON.parse(localStorage.getItem(SESSION_KEY) || "null");
+  } catch {
+    return null;
+  }
+}
+
+function clearSession() {
+  localStorage.removeItem(SESSION_KEY);
+}
+
 function unlockAudio() {
   if (audioReady) return;
   const AudioContext = window.AudioContext || window.webkitAudioContext;
@@ -156,7 +190,7 @@ function playTurnPing() {
 function maybePingTurn(nextState) {
   const oldTurn = state?.status === "playing" ? state.currentPlayerId : null;
   const nextTurn = nextState.status === "playing" ? nextState.currentPlayerId : null;
-  if (nextTurn && nextTurn === socket.id && nextTurn !== oldTurn) {
+  if (nextTurn && nextTurn === clientId && nextTurn !== oldTurn) {
     playTurnPing();
   }
 }
@@ -300,7 +334,7 @@ function makeBadge(label) {
 
 function renderTurn() {
   if (!state) return;
-  const me = socket.id;
+  const me = clientId;
   const isHost = state.hostId === me;
   const isActor = state.currentPlayerId === me;
   const enoughPlayers = state.canStart;
@@ -408,19 +442,38 @@ function showError(key) {
   els.error.textContent = key ? t(key) : "";
 }
 
-function joinRoom() {
+function joinRoom(options = {}) {
   showError("");
   const code = els.code.value.trim().toUpperCase();
-  socket.emit("joinRoom", { name: els.name.value, code }, (reply) => {
-    if (!reply.ok) showError(reply.error);
+  socket.emit("joinRoom", { name: els.name.value, code, clientId }, (reply) => {
+    if (!reply.ok) {
+      if (options.auto && reply.error === "roomNotFound") clearSession();
+      showError(reply.error);
+      return;
+    }
+    saveSession(reply.code || code);
   });
 }
 
 function createRoom() {
   showError("");
-  socket.emit("createRoom", { name: els.name.value, language }, (reply) => {
-    if (!reply.ok) showError(reply.error);
+  socket.emit("createRoom", { name: els.name.value, language, clientId }, (reply) => {
+    if (!reply.ok) {
+      showError(reply.error);
+      return;
+    }
+    saveSession(reply.code);
   });
+}
+
+function reconnectSavedSession() {
+  const saved = getSavedSession();
+  if (!saved?.code || !saved?.name) return;
+
+  els.name.value = saved.name;
+  els.code.value = saved.code;
+  if (saved.language) applyLanguage(saved.language);
+  joinRoom({ auto: true });
 }
 
 els.form.addEventListener("submit", (event) => {
@@ -495,10 +548,14 @@ socket.on("state", (nextState) => {
   maybePingTurn(nextState);
   pendingCardFlip = !state?.currentCard && Boolean(nextState.currentCard);
   state = nextState;
+  saveSession(state.code);
   applyLanguage(state.language);
   clearInterval(tick);
   tick = setInterval(updateTimer, 500);
 });
+
+socket.on("connect", reconnectSavedSession);
+if (socket.connected) reconnectSavedSession();
 
 applyLanguage(language);
 
