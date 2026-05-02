@@ -17,6 +17,7 @@ const BOARD_SPOTS = 48;
 const BOARD_END = BOARD_SPOTS + 1;
 const TURN_SECONDS = 60;
 const EMPTY_ROOM_TTL_MS = 10 * 60 * 1000;
+const HOST_RECONNECT_GRACE_MS = 30 * 1000;
 const DIFFICULTIES = [3, 4, 5];
 const ACTIVITIES = ["describe", "draw", "mime"];
 
@@ -172,6 +173,7 @@ function makeRoom(hostId, language) {
     currentCard: null,
     timer: null,
     cleanupTimer: null,
+    hostTransferTimer: null,
     endsAt: null,
     log: []
   };
@@ -487,13 +489,11 @@ function leaveRoom(socket) {
     player.socketId = null;
   }
 
-  if (room.hostId === clientId) {
-    const nextHost = room.players.find((candidate) => candidate.connected);
-    room.hostId = nextHost ? nextHost.id : room.hostId;
-  }
+  if (room.hostId === clientId) scheduleHostTransfer(room);
 
   if (!activePlayers(room).length) {
     clearTimeout(room.cleanupTimer);
+    clearTimeout(room.hostTransferTimer);
     room.cleanupTimer = setTimeout(() => {
       if (!activePlayers(room).length) {
         clearTurnTimer(room);
@@ -504,6 +504,20 @@ function leaveRoom(socket) {
   }
 
   emitRoom(room);
+}
+
+function scheduleHostTransfer(room) {
+  clearTimeout(room.hostTransferTimer);
+  room.hostTransferTimer = setTimeout(() => {
+    const host = getPlayer(room, room.hostId);
+    if (host?.connected) return;
+
+    const nextHost = room.players.find((candidate) => candidate.connected);
+    if (nextHost) {
+      room.hostId = nextHost.id;
+      emitRoom(room);
+    }
+  }, HOST_RECONNECT_GRACE_MS);
 }
 
 io.on("connection", (socket) => {
@@ -553,6 +567,10 @@ io.on("connection", (socket) => {
       existingPlayer.name = sanitizeName(name) || existingPlayer.name;
       existingPlayer.socketId = socket.id;
       existingPlayer.connected = true;
+      if (room.hostId === stableId) {
+        clearTimeout(room.hostTransferTimer);
+        room.hostTransferTimer = null;
+      }
       socket.data.clientId = stableId;
       socket.data.roomCode = room.code;
       socket.join(room.code);
